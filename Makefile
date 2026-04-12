@@ -2,12 +2,18 @@ CC = x86_64-w64-mingw32-gcc
 CFLAGS = -O2 -s -Wall
 LDFLAGS = -lgdi32 -lwininet
 
-all: loader.exe ghost_loader.exe xor_encode.exe bin2header.exe
+all: loader.exe ghost_loader.exe steg_encode.exe steg_loader.exe xor_encode.exe bin2header.exe
 
 loader.exe: loader.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 ghost_loader.exe: ghost_loader.c
+	$(CC) $(CFLAGS) -masm=att -o $@ $<
+
+steg_encode.exe: steg_encode.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+steg_loader.exe: steg_loader.c
 	$(CC) $(CFLAGS) -masm=att -o $@ $<
 
 # Embedded build: compile shellcode into the binary
@@ -25,6 +31,6 @@ bin2header.exe: bin2header.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 clean:
-	rm -f loader.exe xor_encode.exe bin2header.exe shellcode.h
+	rm -f loader.exe ghost_loader.exe steg_encode.exe steg_loader.exe xor_encode.exe bin2header.exe shellcode.h
 
 .PHONY: all clean embedded
