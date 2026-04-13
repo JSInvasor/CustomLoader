@@ -2,7 +2,7 @@ CC = x86_64-w64-mingw32-gcc
 CFLAGS = -O2 -s -Wall
 LDFLAGS = -lgdi32 -lwininet
 
-all: loader.exe ghost_loader.exe steg_encode.exe steg_loader.exe xor_encode.exe bin2header.exe
+all: loader.exe ghost_loader.exe steg_encode.exe steg_loader.exe xor_encode.exe bin2header.exe implant.exe
 
 loader.exe: loader.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
@@ -30,7 +30,10 @@ xor_encode.exe: xor_encode.c
 bin2header.exe: bin2header.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+implant.exe: c2_client.c
+	$(CC) $(CFLAGS) -mwindows -o $@ $< -lwininet -lgdi32
+
 clean:
-	rm -f loader.exe ghost_loader.exe steg_encode.exe steg_loader.exe xor_encode.exe bin2header.exe shellcode.h
+	rm -f loader.exe ghost_loader.exe steg_encode.exe steg_loader.exe xor_encode.exe bin2header.exe implant.exe shellcode.h
 
 .PHONY: all clean embedded
